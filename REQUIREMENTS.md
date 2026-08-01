@@ -82,6 +82,7 @@ A trade is the core record entered by the user.
 | strike          | float   | yes      | > 0                                                      |
 | premium         | float   | yes      | >= 0, per-share price                                    |
 | contracts       | int     | yes      | >= 1                                                     |
+| broker_fee      | float   | no       | >= 0, total broker commission/fee paid for this trade. Defaults to `0.0`. |
 | status          | str     | yes      | One of: `OPEN`, `CLOSED`, `ASSIGNED`, `EXPIRED`          |
 | notes           | str     | no       | Free text                                                |
 
@@ -100,6 +101,7 @@ Derived from trades via the recalculation engine. One record per `(symbol, strat
 | shares             | int    | Current shares held                                           |
 | cost_basis         | float  | Current cost basis per share                                  |
 | premium_collected  | float  | Total net premium collected (all time)                        |
+| total_fees_paid    | float  | Cumulative broker fees paid across all trades for this position |
 | status             | str    | Strategy-defined status string (e.g. `CSP`, `CC OPEN`, etc.) |
 
 ### 1.3 Assignment
@@ -117,6 +119,7 @@ An event created when a trade reaches `ASSIGNED` status. One record per assignme
 | strike          | float  |                                                    |
 | premium         | float  | Per-share premium of the original trade            |
 | contracts       | int    |                                                    |
+| broker_fee      | float  | Broker fee paid for the original trade             |
 | shares          | int    | Positive for PUT ASSIGNED, negative for CALL ASSIGNED |
 | stock_value     | float  | strike × abs(shares)                               |
 | premium_value   | float  | Net premium cashflow of the trade                  |
@@ -140,6 +143,7 @@ One record per CC trade, tracking the lifecycle of each covered call cycle.
 | strike          | float  |                                                    |
 | premium         | float  |                                                    |
 | contracts       | int    |                                                    |
+| broker_fee      | float  | Broker fee paid for this CC trade                  |
 | shares_covered  | int    | contracts × 100                                    |
 | premium_value   | float  | Net premium cashflow of the trade                  |
 | notes           | str    |                                                    |
@@ -173,7 +177,7 @@ keeping shares, initiating a CC).
 
 ### 2.1 Premium Cashflow
 
-The net premium cashflow for a single trade:
+The gross premium cashflow for a single trade (before fees):
 
 ```
 premium_value = premium × contracts × 100
@@ -182,15 +186,32 @@ premium_value = premium × contracts × 100
 - If `action == "SELL"`: cashflow is **positive** (income)
 - If `action == "BUY"`: cashflow is **negative** (expense, closing a position)
 
-### 2.2 Total Premium (display)
+### 2.2 Net Premium Cashflow (fee-adjusted)
+
+The net cashflow after subtracting the broker fee. This is the value used in all
+P&L and cost basis calculations:
+
+```
+net_premium_value = premium_value - broker_fee
+```
+
+`broker_fee` is always positive and always reduces net income regardless of trade
+direction (fees are a cost on both buys and sells).
+
+> Wherever `premium_value` is used in engine state-machine logic (accumulating
+> `premium_collected`, adjusting `cost_basis`, computing `net_stock_basis`), the
+> value substituted is `net_premium_value`.
+
+### 2.3 Total Premium (display)
 
 ```
 total_premium = premium × contracts × 100
 ```
 
-This is always the gross value (unsigned) used for display in trade lists.
+This is always the **gross** value (unsigned, before fees) used for display in trade
+lists. Use `net_premium_value` wherever actual P&L is computed.
 
-### 2.3 Days to Expiration (DTE)
+### 2.4 Days to Expiration (DTE)
 
 ```
 dte = (expiration - today).days
@@ -198,35 +219,58 @@ dte = (expiration - today).days
 
 Only shown for trades with `status == "OPEN"`. Null/empty for all other statuses.
 
-### 2.4 Net Stock Basis on PUT Assignment
+### 2.5 Net Stock Basis on PUT Assignment
 
-When a CSP is assigned:
+When a CSP is assigned, fees are added to the cost of acquiring the shares:
 
 ```
 shares_added     = contracts × 100
 stock_value      = strike × shares_added
-net_stock_basis  = stock_value - premium_value   # premium_value is positive (SELL)
+net_stock_basis  = stock_value - net_premium_value   # net_premium_value is positive (SELL)
 ```
 
-### 2.5 Net Stock Basis on CALL Assignment
+Because `net_premium_value < premium_value`, the net stock basis is **higher** than
+without fees — reflecting the true cost of entry.
 
-When a CC is assigned (shares called away):
+### 2.6 Net Stock Basis on CALL Assignment
+
+When a CC is assigned (shares called away), fees reduce the net proceeds:
 
 ```
 shares_called_away = contracts × 100
 stock_value        = strike × shares_called_away
-net_stock_basis    = stock_value + premium_value  # premium_value is positive (SELL)
+net_stock_basis    = stock_value + net_premium_value  # net_premium_value is positive (SELL)
 ```
 
-### 2.6 Cost Basis Adjustment from Covered Calls
+### 2.7 Cost Basis Adjustment from Covered Calls
 
-Each time a CC trade is processed (status OPEN, CLOSED, or EXPIRED):
+Each time a CC trade is processed (status OPEN, CLOSED, or EXPIRED), the
+fee-adjusted premium reduces the cost basis:
 
 ```
-cost_basis_per_share -= premium_value / (contracts × 100)
+cost_basis_per_share -= net_premium_value / (contracts × 100)
 ```
 
-This reduces cost basis per share by the per-share premium received.
+### 2.8 Total Net P&L (position close)
+
+When a position cycle ends (CSP bought back or shares sold after assignment),
+the total net profit/loss is:
+
+```
+total_net_pnl = premium_collected - total_fees_paid
+```
+
+Where:
+- `premium_collected` is the running sum of all `net_premium_value` entries
+  accumulated during recalculation (already fee-adjusted per trade)
+- `total_fees_paid` is the running sum of all `broker_fee` values across all trades
+  for the position
+
+> Since each `net_premium_value = premium_value - broker_fee`, and
+> `premium_collected` accumulates `net_premium_value`, fees are already embedded in
+> `premium_collected`. `total_fees_paid` is stored separately for reporting
+> transparency (so the UI can display gross premium, total fees, and net P&L
+> independently).
 
 ---
 
@@ -292,6 +336,7 @@ When a symbol is first seen:
 shares            = 0
 cost_basis        = 0.0
 premium_collected = 0.0
+total_fees_paid   = 0.0
 wheel_status      = "CSP"
 cycle_number      = 0
 ```
@@ -300,28 +345,32 @@ cycle_number      = 0
 
 For every trade with `strategy == "CSP"`:
 
-1. Accumulate `premium_value` into `premium_collected`
-2. If `status == "ASSIGNED"`:
+1. Compute `net_premium_value = premium_value - broker_fee`
+2. Accumulate `net_premium_value` into `premium_collected`
+3. Accumulate `broker_fee` into `total_fees_paid`
+4. If `status == "ASSIGNED"`:
    - `shares += contracts × 100`
-   - `cost_basis = strike - premium` (per-share basis)
+   - `cost_basis = strike - (net_premium_value / (contracts × 100))` (per-share basis, fee-adjusted)
    - `wheel_status = "COVERED CALLS"`
    - `cycle_number += 1`
-   - Create an **Assignment** event with `assignment_type = "PUT ASSIGNED"`
+   - Create an **Assignment** event with `assignment_type = "PUT ASSIGNED"`, carrying `broker_fee`
 
 ### 3.3 CC Trade Processing
 
 For every trade with `strategy == "CC"`:
 
-1. Accumulate `premium_value` into `premium_collected`
-2. Create a **Covered Call Lifecycle** event
-3. If `status` is `OPEN`, `CLOSED`, or `EXPIRED`:
-   - Reduce `cost_basis` by `premium_value / (contracts × 100)`
+1. Compute `net_premium_value = premium_value - broker_fee`
+2. Accumulate `net_premium_value` into `premium_collected`
+3. Accumulate `broker_fee` into `total_fees_paid`
+4. Create a **Covered Call Lifecycle** event, carrying `broker_fee`
+5. If `status` is `OPEN`, `CLOSED`, or `EXPIRED`:
+   - Reduce `cost_basis` by `net_premium_value / (contracts × 100)`
    - If shares > 0: `wheel_status = "CC OPEN"` when OPEN, else `"READY FOR CC"`
-4. If `status == "ASSIGNED"` (shares called away):
+6. If `status == "ASSIGNED"` (shares called away):
    - `shares -= contracts × 100` (floor at 0)
    - If `shares == 0`: `cost_basis = 0`, `wheel_status = "CSP"`
    - If `shares > 0`: `wheel_status = "READY FOR CC"`
-   - Create an **Assignment** event with `assignment_type = "CALL ASSIGNED"`
+   - Create an **Assignment** event with `assignment_type = "CALL ASSIGNED"`, carrying `broker_fee`
 
 ### 3.4 Covered Call Lifecycle Stage Mapping
 
@@ -381,13 +430,17 @@ The `recalculate_positions` operation:
 An Interactive Brokers transaction history CSV with rows in the format:
 
 ```
-Transaction History,Header,Date,Transaction Type,Description,Symbol,Quantity,Price,...
-Transaction History,Data,2026-05-01,BUY,"SOFI 01MAY26 16 P",SOFI,-1,0.25,...
+Transaction History,Header,Date,Transaction Type,Description,Symbol,Quantity,Price,Commission,...
+Transaction History,Data,2026-05-01,BUY,"SOFI 01MAY26 16 P",SOFI,-1,0.25,-1.05,...
 ```
 
 - Rows prefixed with `Transaction History,Header` define the column names
 - Rows prefixed with `Transaction History,Data` contain transaction data
 - All other rows are ignored
+
+The `Commission` column (or equivalent fee column in the IB export) is mapped to
+`broker_fee`. The value is stored as a positive float — if IB exports it as a
+negative number (a debit), take the absolute value.
 
 ### 5.2 Option Symbol Parsing
 
@@ -423,7 +476,8 @@ The user is expected to update status manually after import if needed.
 ### 5.5 Assignment Rows
 
 Rows where the description contains `"Assignment"` or `"Assignation"` are imported
-as trades with `strategy = "CSP"`, `status = "ASSIGNED"`, and `premium = 0.0`.
+as trades with `strategy = "CSP"`, `status = "ASSIGNED"`, `premium = 0.0`, and
+`broker_fee` mapped from the `Commission` column (absolute value, default `0.0`).
 
 ### 5.6 Stock Transaction Rows
 
@@ -453,7 +507,9 @@ Displays summary metrics and a chart. No user input.
 |------------------|----------------------------------------------------------|
 | Weekly Premium   | Sum of `total_premium` for trades in the current week   |
 | Monthly Premium  | Sum of `total_premium` for trades in the current month  |
-| Total Premium    | Sum of all `total_premium`                               |
+| Total Premium    | Sum of all `total_premium` (gross, before fees)          |
+| Total Fees       | Sum of all `broker_fee` across all trades                |
+| Net Premium      | Total Premium − Total Fees                               |
 | Open Positions   | Count of trades with `status == "OPEN"`                 |
 
 Week is defined as `YYYY-W<week_number>` using `strftime("%Y-W%U")`.
@@ -478,6 +534,7 @@ Default values:
 - Strike: `25.0`
 - Premium: `0.50`
 - Contracts: `1`
+- Broker Fee: `0.0`
 - Trade Date: today
 - Expiration: today
 - Strategy: `CSP`
@@ -500,10 +557,10 @@ Displays all trades and allows editing or deleting a selected trade.
 
 Shows all trades with these columns:
 `id, symbol, strategy, action, trade_date, expiration, strike, premium,
-contracts, status, days_to_expiration, total_premium, notes`
+contracts, broker_fee, status, days_to_expiration, total_premium, notes`
 
 - `trade_date` and `expiration` formatted as `YYYY-MM-DD`
-- `strike`, `premium`, `total_premium` formatted as `$X,XXX.XX`
+- `strike`, `premium`, `broker_fee`, `total_premium` formatted as `$X,XXX.XX`
 - `days_to_expiration` is blank for non-OPEN trades
 
 ### 8.2 Edit Trade
@@ -544,21 +601,23 @@ Displays current positions and allows manual position management.
 
 ### 10.1 Summary Metrics
 
-| Metric             | Calculation                                   |
-|--------------------|-----------------------------------------------|
-| Total Premium      | Sum of `premium_collected` across all positions |
-| Tracked Symbols    | Count of positions                            |
-| Assigned Positions | Count of positions where `shares > 0`         |
+| Metric             | Calculation                                              |
+|--------------------|----------------------------------------------------------|
+| Total Premium      | Sum of `premium_collected` across all positions (net, fee-adjusted) |
+| Total Fees Paid    | Sum of `total_fees_paid` across all positions            |
+| Net P&L            | Total Premium (already net) — shown alongside Total Fees for transparency |
+| Tracked Symbols    | Count of positions                                       |
+| Assigned Positions | Count of positions where `shares > 0`                    |
 
 ### 10.2 Positions Table
 
-Columns: `symbol, shares, cost_basis, premium_collected, wheel_status`
-- `premium_collected` and `cost_basis` formatted as `$X,XXX.XX`
+Columns: `symbol, shares, cost_basis, premium_collected, total_fees_paid, wheel_status`
+- `premium_collected`, `total_fees_paid`, and `cost_basis` formatted as `$X,XXX.XX`
 
 ### 10.3 Position Management Panel
 
 User selects a symbol. The panel shows:
-- Shares, Cost Basis/Share, Total Premium, Status (as metrics)
+- Shares, Cost Basis/Share, Net Premium (fee-adjusted), Total Fees Paid, Status (as metrics)
 - A dropdown of available next actions based on current `wheel_status`
 
 #### Available Actions by Status
@@ -603,19 +662,20 @@ Read-only view of all assignment events.
 
 ### 11.1 Summary Metrics
 
-| Metric           | Calculation                                        |
-|------------------|----------------------------------------------------|
-| Assignment Events | Total count of assignment records                 |
-| Shares Assigned  | Sum of `shares` where `shares > 0` (PUT assignments) |
-| Shares Called Away | Sum of abs(`shares`) where `shares < 0` (CALL assignments) |
-| Net Stock Basis  | Sum of `net_stock_basis` across all assignments   |
+| Metric             | Calculation                                                   |
+|--------------------|---------------------------------------------------------------|
+| Assignment Events  | Total count of assignment records                             |
+| Shares Assigned    | Sum of `shares` where `shares > 0` (PUT assignments)          |
+| Shares Called Away | Sum of abs(`shares`) where `shares < 0` (CALL assignments)    |
+| Net Stock Basis    | Sum of `net_stock_basis` across all assignments               |
+| Total Fees         | Sum of `broker_fee` across all assignment records             |
 
 ### 11.2 Assignment Ledger Table
 
 Columns: `id, trade_id, symbol, assignment_date, strategy, assignment_type,
-strike, premium, contracts, shares, stock_value, premium_value, net_stock_basis, notes`
+strike, premium, contracts, broker_fee, shares, stock_value, premium_value, net_stock_basis, notes`
 
-Money columns formatted as `$X,XXX.XX`: `strike, premium, stock_value, premium_value, net_stock_basis`
+Money columns formatted as `$X,XXX.XX`: `strike, premium, broker_fee, stock_value, premium_value, net_stock_basis`
 
 ---
 
@@ -631,14 +691,15 @@ Read-only view of all covered call lifecycle events.
 | Closed Calls | Count where `lifecycle_stage == "CLOSED"`              |
 | Expired Calls | Count where `lifecycle_stage == "EXPIRED"`            |
 | Called Away  | Count where `lifecycle_stage == "CALLED AWAY"`         |
-| CC Premium   | Sum of `premium_value`                                 |
+| CC Premium   | Sum of `premium_value` (net, fee-adjusted)             |
+| Total Fees   | Sum of `broker_fee` across all CC lifecycle records    |
 
 ### 12.2 Lifecycle Ledger Table
 
 Columns: `id, trade_id, symbol, cycle_number, trade_date, expiration, action,
-lifecycle_stage, strike, premium, contracts, shares_covered, premium_value, notes`
+lifecycle_stage, strike, premium, contracts, broker_fee, shares_covered, premium_value, notes`
 
-Money columns formatted as `$X,XXX.XX`: `strike, premium, premium_value`
+Money columns formatted as `$X,XXX.XX`: `strike, premium, broker_fee, premium_value`
 
 ---
 
@@ -707,11 +768,11 @@ No existing module outside `engine.py` and `app.py` needs to be modified.
 
 | Module                           | Test focus                                                                   |
 |----------------------------------|------------------------------------------------------------------------------|
-| `calculations.py`                | Premium cashflow sign (SELL vs BUY), DTE computation, total premium          |
-| `strategies/wheel/engine.py`     | CSP open/closed/expired/assigned, CC open/closed/expired/called away, cost basis reduction, cycle number increment, shares floor at 0 |
+| `calculations.py`                | Premium cashflow sign (SELL vs BUY), net_premium_value with and without broker_fee, DTE computation, total premium |
+| `strategies/wheel/engine.py`     | CSP open/closed/expired/assigned, CC open/closed/expired/called away, cost basis reduction uses net_premium_value, cycle number increment, shares floor at 0, total_fees_paid accumulation, broker_fee propagated to Assignment and lifecycle events |
 | `strategies/wheel/calculations.py` | Wheel-specific math if any                                                 |
 | `strategies/base.py`             | Plugin interface contract: all required methods present and typed correctly  |
-| `importers/ib_importer.py`       | Option symbol parsing (P and C), date parsing, action mapping, assignment row handling, stock row warnings, duplicate detection |
+| `importers/ib_importer.py`       | Option symbol parsing (P and C), date parsing, action mapping, assignment row handling, stock row warnings, duplicate detection, Commission column mapped to broker_fee as positive float |
 | `repository.py`                  | CRUD operations using an in-memory SQLite database                           |
 
 ### 14.2 What Is Not Unit Tested
