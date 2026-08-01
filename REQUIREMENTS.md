@@ -101,7 +101,8 @@ Derived from trades via the recalculation engine. One record per `(symbol, strat
 | shares             | int    | Current shares held                                           |
 | cost_basis         | float  | Current cost basis per share                                  |
 | premium_collected  | float  | Total net premium collected (all time)                        |
-| total_fees_paid    | float  | Cumulative broker fees paid across all trades for this position |
+| total_fees_paid    | float  | Cumulative broker fees paid across all trades and dividends for this position |
+| dividends_collected | float | Total net dividends received (`amount − broker_fee`) for this position |
 | status             | str    | Strategy-defined status string (e.g. `CSP`, `CC OPEN`, etc.) |
 
 ### 1.3 Assignment
@@ -170,6 +171,25 @@ keeping shares, initiating a CC).
 `KEEP_SHARES`, `SELL_CC`, `ADJUST_PREMIUM`
 
 > Other strategies define their own action type vocabularies independently.
+
+### 1.6 Dividend
+
+A dividend payment received while holding shares during the wheel cycle.
+
+| Field          | Type   | Required | Constraints                                   |
+|----------------|--------|----------|-----------------------------------------------|
+| id             | int    | auto     | Primary key, auto-increment                   |
+| strategy_type  | str    | yes      | Plugin identifier, e.g. `"wheel"`             |
+| symbol         | str    | yes      | Uppercase ticker                              |
+| dividend_date  | date   | yes      | Date the dividend was received                |
+| amount         | float  | yes      | Total cash received (gross, before fees). >= 0 |
+| shares         | int    | yes      | Number of shares held at dividend date. >= 1  |
+| broker_fee     | float  | no       | Any fee deducted by broker. Defaults to `0.0` |
+| notes          | str    | no       | Free text                                     |
+
+Dividends are recorded independently from trades. They are replayed by the
+recalculation engine alongside trades (ordered by date) to update
+`dividends_collected` and `cost_basis`.
 
 ---
 
@@ -271,6 +291,44 @@ Where:
 > `premium_collected`. `total_fees_paid` is stored separately for reporting
 > transparency (so the UI can display gross premium, total fees, and net P&L
 > independently).
+
+### 2.9 Dividend Calculations
+
+**Net dividend cashflow (fee-adjusted):**
+
+```
+net_dividend = amount - broker_fee
+```
+
+**Dividend per share:**
+
+```
+dividend_per_share = net_dividend / shares
+```
+
+**Cost basis adjustment on dividend receipt:**
+
+```
+cost_basis_per_share -= dividend_per_share
+```
+
+The dividend reduces the cost basis per share, reflecting that part of the
+original investment has been returned as income.
+
+**Dividend accumulation:**
+`net_dividend` is accumulated into `dividends_collected` on the position.
+`broker_fee` is accumulated into `total_fees_paid`.
+
+**Total Net P&L (updated to include dividends):**
+
+```
+total_net_pnl = premium_collected + dividends_collected - total_fees_paid
+```
+
+> `dividends_collected` already embeds its fees (via `net_dividend`).
+> `total_fees_paid` covers fees from both trades and dividends, stored
+> separately for reporting transparency so the UI can display gross premium,
+> total dividends, total fees, and net P&L independently.
 
 ---
 
@@ -388,6 +446,26 @@ Recalculation is triggered after any of the following operations:
 - Updating a trade
 - Deleting a trade
 - Importing trades
+- Adding, editing, or deleting a dividend
+- Importing dividends from IB CSV
+
+### 3.6 Dividend Processing
+
+Dividends are replayed interleaved with trades in chronological order
+(`dividend_date ASC`). A dividend is only processed if `shares > 0` at the
+time of the dividend date.
+
+For each dividend record:
+
+1. Compute `net_dividend = amount - broker_fee`
+2. Compute `dividend_per_share = net_dividend / shares`
+3. Accumulate `net_dividend` into `dividends_collected`
+4. Accumulate `broker_fee` into `total_fees_paid`
+5. Reduce `cost_basis` by `dividend_per_share`
+
+The recalculation engine clears and rebuilds derived position data as part of
+`recalculate_positions` — dividends are re-read from the `dividends` table and
+re-applied each time alongside trades.
 
 ---
 
@@ -412,14 +490,20 @@ All database access goes through the repository layer. No SQL outside this layer
 | `record_position_action` | Insert a position action record                   |
 | `update_position_status` | Update `wheel_status` on a position              |
 | `adjust_position_premium` | Add a delta to `premium_collected` and recalculate `cost_basis` |
+| `add_dividend`            | Insert a new dividend record                        |
+| `update_dividend`         | Update all fields of an existing dividend by id     |
+| `delete_dividend`         | Delete a dividend by id                             |
+| `get_dividends`           | Return all dividends ordered by `dividend_date DESC` |
+| `get_dividends_by_symbol` | Return dividends for a specific symbol, ordered by `dividend_date DESC` |
 
 ### 4.2 Recalculate Positions
 
 The `recalculate_positions` operation:
 1. Loads all trades in chronological order
-2. Clears the `positions`, `assignments`, and `covered_call_lifecycle` tables
-3. Replays trades according to the engine rules (Section 3)
-4. Writes the resulting positions, assignments, and lifecycle events
+2. Loads all dividends in chronological order
+3. Clears the `positions`, `assignments`, and `covered_call_lifecycle` tables
+4. Replays trades and dividends interleaved by date according to the engine rules (Section 3)
+5. Writes the resulting positions, assignments, and lifecycle events
 
 ---
 
@@ -492,8 +576,28 @@ Duplicates are skipped and counted in warnings.
 
 ### 5.8 Return Value
 
-The importer returns `(trades: list[dict], warnings: list[str])`.
+The importer returns `(trades: list[dict], dividends: list[dict], warnings: list[str])`.
 It does not write to the database directly. The caller is responsible for saving.
+
+### 5.9 Dividend Rows
+
+Rows where `Transaction Type == "Dividends"` are parsed as dividend records:
+
+- `symbol` — taken from the `Symbol` column (uppercase)
+- `dividend_date` — taken from the `Date` column (ISO 8601 format)
+- `amount` — absolute value of the `Price` column (IB may export as negative)
+- `broker_fee` — absolute value of the `Commission` column (default `0.0`)
+- `shares` — not available in the IB row; pre-filled from the current position's
+  `shares` value if the symbol exists, otherwise defaults to `0` and is flagged
+  as a warning requiring manual correction before import
+- `strategy_type` — defaults to `"wheel"`
+
+**Duplicate detection:** match on `symbol + dividend_date + amount`.
+Duplicates are skipped and counted in warnings.
+
+Dividend rows are returned in the `dividends` list of the return value (§5.8).
+They are displayed in a separate preview table on the Import page and imported
+independently from trades.
 
 ---
 
@@ -508,8 +612,9 @@ Displays summary metrics and a chart. No user input.
 | Weekly Premium   | Sum of `total_premium` for trades in the current week   |
 | Monthly Premium  | Sum of `total_premium` for trades in the current month  |
 | Total Premium    | Sum of all `total_premium` (gross, before fees)          |
-| Total Fees       | Sum of all `broker_fee` across all trades                |
-| Net Premium      | Total Premium − Total Fees                               |
+| Total Dividends  | Sum of `dividends_collected` across all positions (net, fee-adjusted) |
+| Total Fees       | Sum of all `broker_fee` across all trades and dividends  |
+| Net Premium      | Total Premium + Total Dividends − Total Fees             |
 | Open Positions   | Count of trades with `status == "OPEN"`                 |
 
 Week is defined as `YYYY-W<week_number>` using `strftime("%Y-W%U")`.
@@ -604,20 +709,21 @@ Displays current positions and allows manual position management.
 | Metric             | Calculation                                              |
 |--------------------|----------------------------------------------------------|
 | Total Premium      | Sum of `premium_collected` across all positions (net, fee-adjusted) |
+| Total Dividends    | Sum of `dividends_collected` across all positions (net, fee-adjusted) |
 | Total Fees Paid    | Sum of `total_fees_paid` across all positions            |
-| Net P&L            | Total Premium (already net) — shown alongside Total Fees for transparency |
+| Net P&L            | Total Premium + Total Dividends − Total Fees Paid        |
 | Tracked Symbols    | Count of positions                                       |
 | Assigned Positions | Count of positions where `shares > 0`                    |
 
 ### 10.2 Positions Table
 
-Columns: `symbol, shares, cost_basis, premium_collected, total_fees_paid, wheel_status`
-- `premium_collected`, `total_fees_paid`, and `cost_basis` formatted as `$X,XXX.XX`
+Columns: `symbol, shares, cost_basis, premium_collected, dividends_collected, total_fees_paid, wheel_status`
+- `premium_collected`, `dividends_collected`, `total_fees_paid`, and `cost_basis` formatted as `$X,XXX.XX`
 
 ### 10.3 Position Management Panel
 
 User selects a symbol. The panel shows:
-- Shares, Cost Basis/Share, Net Premium (fee-adjusted), Total Fees Paid, Status (as metrics)
+- Shares, Cost Basis/Share, Net Premium (fee-adjusted), Total Dividends (net), Total Fees Paid, Status (as metrics)
 - A dropdown of available next actions based on current `wheel_status`
 
 #### Available Actions by Status
@@ -703,14 +809,45 @@ Money columns formatted as `$X,XXX.XX`: `strike, premium, broker_fee, premium_va
 
 ---
 
-## 13. Architecture Constraints
+## 13. Dividends Page
 
-### 13.1 Module Boundaries
+Displays all dividend records and allows manual entry, editing, and deletion of dividends.
+
+### 13.1 Summary Metrics
+
+| Metric            | Calculation                                                  |
+|-------------------|--------------------------------------------------------------|
+| Dividend Events   | Total count of dividend records                              |
+| Total Dividends   | Sum of `net_dividend` across all records (net, fee-adjusted) |
+| Total Fees        | Sum of `broker_fee` across all dividend records              |
+
+### 13.2 Dividend Ledger Table
+
+Columns: `id, symbol, dividend_date, amount, shares, broker_fee, net_dividend, dividend_per_share, notes`
+
+Money columns formatted as `$X,XXX.XX`: `amount, broker_fee, net_dividend, dividend_per_share`
+
+### 13.3 Add / Edit Dividend Form
+
+Fields: `symbol` (uppercase), `dividend_date` (date), `amount` (float ≥ 0),
+`shares` (int ≥ 1, pre-filled from current position `shares` if the symbol exists),
+`broker_fee` (float ≥ 0, default `0.0`), `notes`.
+
+On submit: save dividend, trigger recalculation, refresh page.
+
+Delete button with confirmation step ("Are you sure?").
+On confirm: delete dividend, trigger recalculation, refresh page.
+
+---
+
+## 14. Architecture Constraints
+
+### 14.1 Module Boundaries
 
 | Module                              | Responsibility                                             | May import               |
 |-------------------------------------|------------------------------------------------------------|--------------------------|
 | `config.py`                         | Paths and constants only                                   | stdlib only              |
-| `models.py`                         | Dataclasses for Trade, Position, Assignment, PluginResult, etc. | stdlib only         |
+| `models.py`                         | Dataclasses for Trade, Position, Assignment, Dividend, PluginResult, etc. | stdlib only |
 | `database.py`                       | DB connection and schema initialization only               | config                   |
 | `repository.py`                     | All SQL queries. No business logic.                        | config, models, database |
 | `engine.py`                         | Plugin registry + recalculation orchestration. No SQL.     | models, strategies/*     |
@@ -718,7 +855,7 @@ Money columns formatted as `$X,XXX.XX`: `strike, premium, broker_fee, premium_va
 | `strategies/wheel/engine.py`        | Wheel-specific position state machine                      | models, strategies/base  |
 | `strategies/wheel/calculations.py`  | Wheel-specific pure math functions                         | stdlib, pandas           |
 | `strategies/<name>/engine.py`       | Future strategy state machine (same interface)             | models, strategies/base  |
-| `calculations.py`                   | Shared pure math functions (premium, DTE, etc.)            | stdlib, pandas           |
+| `calculations.py`                   | Shared pure math functions (premium, DTE, dividends, etc.) | stdlib, pandas           |
 | `importers/base.py`                 | `StrategyImporter` abstract base class                     | models                   |
 | `importers/ib_importer.py`          | IB CSV parsing. Dispatches to per-strategy importers.      | stdlib, models           |
 | `importers/wheel/ib_importer.py`    | Wheel-specific IB row parsing                              | stdlib, models           |
@@ -727,27 +864,27 @@ Money columns formatted as `$X,XXX.XX`: `strike, premium, broker_fee, premium_va
 | `views/strategies/<name>/`          | Strategy-specific pages (positions, lifecycle, etc.)       | strategies/*, views/     |
 | `app.py`                            | Entry point. Wires pages together.                         | streamlit, views         |
 
-### 13.2 Strategy Isolation
+### 14.2 Strategy Isolation
 
 Each strategy is fully contained in `strategies/<name>/`. It must not import from
 another strategy's package. Shared logic lives in `calculations.py` or `models.py`.
 
-### 13.3 No Business Logic in Views
+### 14.3 No Business Logic in Views
 
 Views call repository and engine functions. They do not contain calculation logic,
 SQL, or position state transitions.
 
-### 13.4 No SQL Outside Repository
+### 14.4 No SQL Outside Repository
 
 All SQL queries live in `repository.py`. Plugins receive plain Python objects
 (dataclasses or dicts), not database connections.
 
-### 13.5 Pure Functions in Engines and Calculations
+### 14.5 Pure Functions in Engines and Calculations
 
 `engine.py`, `strategies/*/engine.py`, and `calculations.py` functions take inputs
 and return outputs with no side effects. This makes them unit-testable without a database.
 
-### 13.6 Adding a New Strategy
+### 14.6 Adding a New Strategy
 
 To add a new strategy, a contributor must:
 
@@ -762,24 +899,26 @@ No existing module outside `engine.py` and `app.py` needs to be modified.
 
 ---
 
-## 14. Test Requirements
+## 15. Test Requirements
 
-### 14.1 What Must Be Tested
+### 15.1 What Must Be Tested
 
-| Module                           | Test focus                                                                   |
-|----------------------------------|------------------------------------------------------------------------------|
-| `calculations.py`                | Premium cashflow sign (SELL vs BUY), net_premium_value with and without broker_fee, DTE computation, total premium |
-| `strategies/wheel/engine.py`     | CSP open/closed/expired/assigned, CC open/closed/expired/called away, cost basis reduction uses net_premium_value, cycle number increment, shares floor at 0, total_fees_paid accumulation, broker_fee propagated to Assignment and lifecycle events |
-| `strategies/wheel/calculations.py` | Wheel-specific math if any                                                 |
-| `strategies/base.py`             | Plugin interface contract: all required methods present and typed correctly  |
-| `importers/ib_importer.py`       | Option symbol parsing (P and C), date parsing, action mapping, assignment row handling, stock row warnings, duplicate detection, Commission column mapped to broker_fee as positive float |
-| `repository.py`                  | CRUD operations using an in-memory SQLite database                           |
+| Module                                  | Test focus                                                                   |
+|-----------------------------------------|------------------------------------------------------------------------------|
+| `calculations.py`                       | Premium cashflow sign (SELL vs BUY), net_premium_value with and without broker_fee, DTE computation, total premium, net_dividend, dividend_per_share |
+| `strategies/wheel/engine.py`            | CSP open/closed/expired/assigned, CC open/closed/expired/called away, cost basis reduction uses net_premium_value, cycle number increment, shares floor at 0, total_fees_paid accumulation, broker_fee propagated to Assignment and lifecycle events |
+| `strategies/wheel/engine.py` (dividend) | Dividend reduces cost_basis by dividend_per_share, accumulates dividends_collected, accumulates total_fees_paid, skipped when shares == 0 |
+| `strategies/wheel/calculations.py`      | Wheel-specific math if any                                                   |
+| `strategies/base.py`                    | Plugin interface contract: all required methods present and typed correctly   |
+| `importers/ib_importer.py`              | Option symbol parsing (P and C), date parsing, action mapping, assignment row handling, stock row warnings, duplicate detection, Commission column mapped to broker_fee as positive float |
+| `importers/ib_importer.py` (dividend)   | Dividend row parsed correctly, amount as positive float, duplicate detection, shares pre-filled from position when available |
+| `repository.py`                         | CRUD operations for trades, positions, assignments, lifecycle events, position actions, and dividends using an in-memory SQLite database |
 
-### 14.2 What Is Not Unit Tested
+### 15.2 What Is Not Unit Tested
 
 Streamlit view functions are not unit tested. Acceptance is done by manual review.
 
-### 14.3 Test Framework
+### 15.3 Test Framework
 
 `pytest`. Tests live in a `tests/` directory at the project root.
 Each module has a corresponding test file: `tests/test_calculations.py`,
@@ -787,7 +926,7 @@ Each module has a corresponding test file: `tests/test_calculations.py`,
 
 ---
 
-## 15. Configuration
+## 16. Configuration
 
 | Constant   | Value                                                        | Description                        |
 |------------|--------------------------------------------------------------|------------------------------------|
@@ -823,7 +962,7 @@ installer or uninstaller.
 
 ---
 
-## 16. Build & Run
+## 17. Build & Run
 
 - **Run:** `streamlit run app.py`
 - **Dependencies:** `streamlit`, `pandas`, `plotly`, `openpyxl`
@@ -832,20 +971,20 @@ installer or uninstaller.
 
 ---
 
-## 17. Windows Installer
+## 18. Windows Installer
 
 A self-contained Windows installer is required early in the project to allow
 integration testers to install and run the application without a Python development
 environment.
 
-### 17.1 Goals
+### 18.1 Goals
 
 - Single `.exe` installer that sets up everything needed to run the app on a clean
   Windows machine (no Python, no pip, no command line required)
 - Produces a desktop shortcut and/or Start Menu entry that launches the app directly
 - Must work on Windows 10 and Windows 11
 
-### 17.2 Packaging Approach
+### 18.2 Packaging Approach
 
 Use **PyInstaller** to bundle the Streamlit application and all dependencies into a
 standalone executable, then wrap that bundle with **Inno Setup** to produce a
@@ -856,12 +995,12 @@ standard Windows installer (`.exe`).
 | PyInstaller | Bundles Python runtime + app + dependencies into a single folder  |
 | Inno Setup  | Wraps the PyInstaller output into a signed, wizard-style installer |
 
-### 17.3 PyInstaller Spec
+### 18.3 PyInstaller Spec
 
 A `financial_tracker.spec` file at the project root controls the PyInstaller build.
 Key requirements:
 
-- Entry point: `launcher.py` (see §17.4)
+- Entry point: `launcher.py` (see §18.4)
 - `--onedir` mode (folder bundle, not single-file) for faster startup and easier
   debugging by testers
 - Hidden imports for `streamlit`, `plotly`, `pandas`, `openpyxl`, and `sqlite3`
@@ -871,7 +1010,7 @@ Key requirements:
 - The `streamlit` static assets folder must be added as a data directory:
   `streamlit/static` → bundled under `streamlit/static`
 
-### 17.4 Launcher Script
+### 18.4 Launcher Script
 
 Streamlit cannot be launched as a normal Python script via PyInstaller because it
 expects to be run with `streamlit run`. A thin launcher module (`launcher.py`)
@@ -891,7 +1030,7 @@ if __name__ == "__main__":
 
 PyInstaller targets `launcher.py` as the entry point, not `app.py` directly.
 
-### 17.5 Inno Setup Script
+### 18.5 Inno Setup Script
 
 An `installer.iss` file at the project root controls the Inno Setup build.
 Key sections:
@@ -911,7 +1050,7 @@ Key sections:
 > replaces the install directory in-place on upgrade. Because the database lives in
 > `%APPDATA%`, it is untouched during the upgrade — the tester's data is always safe.
 
-### 17.6 Build Steps
+### 18.6 Build Steps
 
 The full build process (to be run by a developer, not the end user):
 
@@ -929,13 +1068,13 @@ iscc installer.iss
 
 Output: `Output\FinancialStrategyTracker-Setup-<version>.exe`
 
-### 17.7 Versioning
+### 18.7 Versioning
 
 The installer version is sourced from a `VERSION` file at the project root
 (plain text, e.g. `0.1.0`). Both `financial_tracker.spec` and `installer.iss`
 read this file so the version only needs to be updated in one place.
 
-### 17.8 Tester Acceptance Criteria
+### 18.8 Tester Acceptance Criteria
 
 | Criterion                                | How verified                                                       |
 |------------------------------------------|--------------------------------------------------------------------|
