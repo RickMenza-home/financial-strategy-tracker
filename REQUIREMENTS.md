@@ -789,11 +789,37 @@ Each module has a corresponding test file: `tests/test_calculations.py`,
 
 ## 15. Configuration
 
-| Constant   | Value                              | Description               |
-|------------|------------------------------------|---------------------------|
-| `BASE_DIR` | `Path(__file__).parent`            | Project root directory    |
-| `DATA_DIR` | `BASE_DIR / "data"`                | Directory for SQLite file |
-| `DB_NAME`  | `DATA_DIR / "tracker.db"`          | SQLite database path      |
+| Constant   | Value                                                        | Description                        |
+|------------|--------------------------------------------------------------|------------------------------------|
+| `BASE_DIR` | `Path(__file__).parent`                                      | Project root / bundle directory    |
+| `DATA_DIR` | See rule below                                               | Directory for SQLite file          |
+| `DB_NAME`  | `DATA_DIR / "tracker.db"`                                    | SQLite database path               |
+
+**`DATA_DIR` resolution rule** (in `config.py`):
+
+```python
+import os, sys
+from pathlib import Path
+
+BASE_DIR = Path(__file__).parent
+
+if getattr(sys, "frozen", False):
+    # Running inside a PyInstaller bundle — use a user-writable location
+    # so the database survives upgrades and uninstalls.
+    DATA_DIR = Path(os.environ["APPDATA"]) / "FinancialStrategyTracker" / "data"
+else:
+    # Development — keep data/ next to the source tree
+    DATA_DIR = BASE_DIR / "data"
+
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+DB_NAME = DATA_DIR / "tracker.db"
+```
+
+When frozen, the database lives at:
+`C:\Users\<user>\AppData\Roaming\FinancialStrategyTracker\data\tracker.db`
+
+This path is outside the install directory, so it is never touched by the
+installer or uninstaller.
 
 ---
 
@@ -803,3 +829,120 @@ Each module has a corresponding test file: `tests/test_calculations.py`,
 - **Dependencies:** `streamlit`, `pandas`, `plotly`, `openpyxl`
 - **Python:** 3.11+
 - **Database:** SQLite, file-based, auto-created on first run
+
+---
+
+## 17. Windows Installer
+
+A self-contained Windows installer is required early in the project to allow
+integration testers to install and run the application without a Python development
+environment.
+
+### 17.1 Goals
+
+- Single `.exe` installer that sets up everything needed to run the app on a clean
+  Windows machine (no Python, no pip, no command line required)
+- Produces a desktop shortcut and/or Start Menu entry that launches the app directly
+- Must work on Windows 10 and Windows 11
+
+### 17.2 Packaging Approach
+
+Use **PyInstaller** to bundle the Streamlit application and all dependencies into a
+standalone executable, then wrap that bundle with **Inno Setup** to produce a
+standard Windows installer (`.exe`).
+
+| Tool        | Role                                                              |
+|-------------|-------------------------------------------------------------------|
+| PyInstaller | Bundles Python runtime + app + dependencies into a single folder  |
+| Inno Setup  | Wraps the PyInstaller output into a signed, wizard-style installer |
+
+### 17.3 PyInstaller Spec
+
+A `financial_tracker.spec` file at the project root controls the PyInstaller build.
+Key requirements:
+
+- Entry point: `launcher.py` (see §17.4)
+- `--onedir` mode (folder bundle, not single-file) for faster startup and easier
+  debugging by testers
+- Hidden imports for `streamlit`, `plotly`, `pandas`, `openpyxl`, and `sqlite3`
+  must be declared explicitly because PyInstaller cannot auto-detect them
+- The `data/` directory is **not bundled** — it is created at runtime under
+  `%APPDATA%\FinancialStrategyTracker\data\` by `config.py` on first launch
+- The `streamlit` static assets folder must be added as a data directory:
+  `streamlit/static` → bundled under `streamlit/static`
+
+### 17.4 Launcher Script
+
+Streamlit cannot be launched as a normal Python script via PyInstaller because it
+expects to be run with `streamlit run`. A thin launcher module (`launcher.py`)
+wraps this:
+
+```python
+import sys
+import os
+from streamlit.web import cli as stcli
+
+if __name__ == "__main__":
+    # Point to the bundled app.py
+    app_path = os.path.join(os.path.dirname(__file__), "app.py")
+    sys.argv = ["streamlit", "run", app_path, "--server.headless=true"]
+    sys.exit(stcli.main())
+```
+
+PyInstaller targets `launcher.py` as the entry point, not `app.py` directly.
+
+### 17.5 Inno Setup Script
+
+An `installer.iss` file at the project root controls the Inno Setup build.
+Key sections:
+
+- `[Setup]` — app name, version, publisher, default install dir
+  (`{autopf}\FinancialStrategyTracker`), output filename
+  (`FinancialStrategyTracker-Setup-{version}.exe`)
+- `[Files]` — recursively includes the PyInstaller `dist\financial_tracker\` output
+- `[Icons]` — desktop shortcut and Start Menu entry pointing to the bundled `.exe`
+- `[Run]` — optionally launches the app after install completes
+- `[UninstallDelete]` — removes **only** the install directory (`{app}`).
+  The user data directory (`{userappdata}\FinancialStrategyTracker\`) is
+  **never touched** by the installer or uninstaller, preserving the database
+  across upgrades and uninstalls.
+
+> **Upgrade behaviour:** Inno Setup's default `[Setup] > AppId` + `CloseApplications=yes`
+> replaces the install directory in-place on upgrade. Because the database lives in
+> `%APPDATA%`, it is untouched during the upgrade — the tester's data is always safe.
+
+### 17.6 Build Steps
+
+The full build process (to be run by a developer, not the end user):
+
+```
+# 1. Install build tools (one-time)
+pip install pyinstaller
+
+# 2. Bundle the application
+pyinstaller financial_tracker.spec
+
+# 3. Open installer.iss in Inno Setup and click Build,
+#    or use the Inno Setup command-line compiler:
+iscc installer.iss
+```
+
+Output: `Output\FinancialStrategyTracker-Setup-<version>.exe`
+
+### 17.7 Versioning
+
+The installer version is sourced from a `VERSION` file at the project root
+(plain text, e.g. `0.1.0`). Both `financial_tracker.spec` and `installer.iss`
+read this file so the version only needs to be updated in one place.
+
+### 17.8 Tester Acceptance Criteria
+
+| Criterion                                | How verified                                                       |
+|------------------------------------------|--------------------------------------------------------------------|
+| Installs silently on clean Windows 10/11 | Fresh VM with no Python installed                                  |
+| Desktop shortcut launches the app        | Double-click opens browser to `localhost:8501`                     |
+| Database persists across restarts        | Add a trade, restart app, trade still present                      |
+| Database survives an upgrade             | Add a trade, install a newer version over it, trade still present  |
+| Database survives an uninstall           | Uninstall app, reinstall, `%APPDATA%` data directory still intact  |
+| Uninstaller removes only app files       | Add/Remove Programs → Uninstall; `%APPDATA%` folder not deleted    |
+| No antivirus false-positive block        | Test with Windows Defender enabled                                 |
