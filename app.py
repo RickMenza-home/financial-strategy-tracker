@@ -61,12 +61,12 @@ if selection == "Dashboard":
     render(repo)
 
 elif selection == "Add Trade":
-    st.header("Add Trade")
-    st.info("Coming in Task 8.")
+    from views.add_trade import render as render_add_trade
+    render_add_trade(repo)
 
 elif selection == "Trades":
-    st.header("Trades")
-    st.info("Coming in Task 8.")
+    from views.trades import render as render_trades
+    render_trades(repo)
 
 elif selection == "Import Trades":
     st.header("Import Trades")

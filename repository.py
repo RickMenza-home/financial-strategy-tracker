@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Callable
 
 from config import DB_NAME
+from constants import TradeAction
 from database import get_connection, init_db, _get_schema
 from models import (
     Assignment,
@@ -51,7 +52,7 @@ def _row_to_trade(row) -> Trade:
         strategy_type=row["strategy_type"],
         symbol=row["symbol"],
         strategy=row["strategy"],
-        action=row["action"],
+        action=TradeAction(row["action"]),
         trade_date=_date(row["trade_date"]),
         expiration=_date(row["expiration"]),
         strike=row["strike"],

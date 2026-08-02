@@ -67,4 +67,4 @@ def render(repo: Repository) -> None:
     # ------------------------------------------------------------------
     # Weekly premium bar chart (§6.2)
     # ------------------------------------------------------------------
-    st.plotly_chart(premium_by_week_chart(trades), use_container_width=True)
+    st.plotly_chart(premium_by_week_chart(trades), width="stretch")
