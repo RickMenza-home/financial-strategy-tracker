@@ -26,6 +26,7 @@ def main():
             "streamlit",
             "run",
             app_path,
+            "--global.developmentMode=false",
             "--server.headless=false",
             "--browser.gatherUsageStats=false",
         ]

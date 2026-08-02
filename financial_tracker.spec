@@ -9,8 +9,11 @@ Output: dist/financial_tracker/  (onedir bundle)
 """
 
 import importlib
+import importlib.metadata
 import os
 from pathlib import Path
+
+from PyInstaller.utils.hooks import copy_metadata, collect_all
 
 # ---------------------------------------------------------------------------
 # Version (read from VERSION file at project root)
@@ -26,16 +29,48 @@ streamlit_pkg = Path(importlib.import_module("streamlit").__file__).parent
 streamlit_static = str(streamlit_pkg / "static")
 
 # ---------------------------------------------------------------------------
+# Package metadata (importlib.metadata needs *.dist-info at runtime)
+# ---------------------------------------------------------------------------
+
+metadata_packages = [
+    "streamlit",
+    "altair",
+    "pandas",
+    "plotly",
+    "pyarrow",
+    "numpy",
+    "packaging",
+    "importlib_metadata",
+    "tornado",
+    "click",
+    "rich",
+    "toml",
+    "gitpython",
+    "pydeck",
+]
+
+metadata_datas = []
+for pkg in metadata_packages:
+    try:
+        metadata_datas += copy_metadata(pkg)
+    except Exception:
+        pass  # skip packages not installed
+
+# ---------------------------------------------------------------------------
+# Collect all streamlit submodules, data files, and binaries
+# ---------------------------------------------------------------------------
+
+st_datas, st_binaries, st_hiddenimports = collect_all("streamlit")
+
+# ---------------------------------------------------------------------------
 # Analysis
 # ---------------------------------------------------------------------------
 
 a = Analysis(
     ["launcher.py"],
     pathex=[],
-    binaries=[],
+    binaries=[] + st_binaries,
     datas=[
-        # Streamlit needs its static web assets at runtime
-        (streamlit_static, "streamlit/static"),
         # Include app source files that launcher.py references
         ("app.py", "."),
         ("config.py", "."),
@@ -51,16 +86,13 @@ a = Analysis(
         ("importers", "importers"),
         ("strategies", "strategies"),
         ("views", "views"),
-    ],
+    ] + metadata_datas + st_datas,
     hiddenimports=[
-        "streamlit",
-        "streamlit.web.cli",
-        "streamlit.runtime.scriptrunner",
         "plotly",
         "pandas",
         "openpyxl",
         "sqlite3",
-    ],
+    ] + st_hiddenimports,
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
