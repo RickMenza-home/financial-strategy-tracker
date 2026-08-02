@@ -10,6 +10,8 @@ from dataclasses import dataclass, field
 from datetime import date, datetime
 from typing import Any
 
+from constants import TradeAction
+
 
 # ---------------------------------------------------------------------------
 # Core trade record
@@ -23,7 +25,7 @@ class Trade:
     strategy_type: str      # Plugin identifier, e.g. "wheel"
     symbol: str             # Uppercase ticker, e.g. "SOFI"
     strategy: str           # Trade sub-type within the strategy, e.g. "CSP", "CC"
-    action: str             # "SELL" or "BUY"
+    action: TradeAction         # TradeAction.SELL or TradeAction.BUY
     trade_date: date        # ISO 8601
     expiration: date        # ISO 8601, must be >= trade_date
     strike: float           # > 0
@@ -101,7 +103,7 @@ class CoveredCallLifecycle:
     cycle_number: int           # Incremented each time a PUT is assigned
     trade_date: date
     expiration: date
-    action: str                 # "SELL" or "BUY"
+    action: TradeAction         # TradeAction.SELL or TradeAction.BUY
     lifecycle_stage: str        # "OPEN", "CLOSED", "EXPIRED", "CALLED AWAY"
     strike: float
     premium: float

@@ -16,6 +16,7 @@ from models import (
     PositionAction,
     Trade,
 )
+from constants import TradeAction
 from repository import Repository
 
 
@@ -39,7 +40,7 @@ def _trade(**overrides) -> Trade:
         strategy_type="wheel",
         symbol="SOFI",
         strategy="CSP",
-        action="SELL",
+        action=TradeAction.SELL,
         trade_date=date(2026, 1, 10),
         expiration=date(2026, 2, 21),
         strike=16.0,
@@ -98,7 +99,7 @@ def _lifecycle(trade_id: int, **overrides) -> CoveredCallLifecycle:
         cycle_number=1,
         trade_date=date(2026, 3, 1),
         expiration=date(2026, 3, 21),
-        action="SELL",
+        action=TradeAction.SELL,
         lifecycle_stage="OPEN",
         strike=17.0,
         premium=0.40,
