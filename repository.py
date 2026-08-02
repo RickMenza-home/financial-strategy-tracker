@@ -178,7 +178,7 @@ class Repository:
     def _release(self, conn) -> None:
         """Close the connection unless it is the shared in-memory connection."""
         if conn is not self._shared_conn:
-            self._release(conn)
+            conn.close()
 
     # ------------------------------------------------------------------
     # Trades
@@ -569,18 +569,11 @@ class Repository:
 
     def recalculate_positions(self) -> None:
         """
-        Stub: clear derived tables and write nothing yet.
-
-        This will be wired to the strategy engine in Task 5 so that all
-        positions, assignments, and lifecycle events are rebuilt by replaying
-        trades in chronological order.
+        Rebuild all positions, assignments, and lifecycle events by replaying
+        trades and dividends through the strategy engine (§4.2).
         """
-        conn = self._conn()
-        with conn:
-            conn.execute("DELETE FROM covered_call_lifecycle")
-            conn.execute("DELETE FROM assignments")
-            conn.execute("DELETE FROM positions")
-        self._release(conn)
+        from engine import recalculate_positions as _engine_recalc
+        _engine_recalc(self)
 
     # ------------------------------------------------------------------
     # Internal helpers used by the engine (Task 5)
