@@ -10,5 +10,17 @@ class TradeAction(str, Enum):
     BUY  = "BUY"
 
 
+class AssignmentType(str, Enum):
+    """Direction of an option assignment."""
+    PUT  = "PUT"   # shares acquired via CSP assignment
+    CALL = "CALL"  # shares called away via CC assignment
+
+
+class EventType(Enum):
+    """Which event to process next during interleaved replay."""
+    TRADE    = "TRADE"
+    DIVIDEND = "DIVIDEND"
+
+
 # Number of shares represented by one options contract.
 SHARES_PER_CONTRACT = 100

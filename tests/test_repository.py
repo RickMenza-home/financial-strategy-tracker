@@ -479,31 +479,43 @@ class TestDividendCRUD:
 # Recalculate positions stub
 # ---------------------------------------------------------------------------
 
-class TestRecalculatePositionsStub:
+class TestRecalculatePositions:
+    """recalculate_positions now calls the real engine (wired in Task 5)."""
 
-    def test_stub_clears_positions(self, repo):
+    def test_clears_and_rebuilds_positions(self, repo):
         repo.upsert_position(_position())
+        # No trades — engine produces no positions, so table ends up empty
         repo.recalculate_positions()
         assert repo.get_positions() == []
 
-    def test_stub_clears_assignments(self, repo):
+    def test_rebuilds_assignment_from_trade(self, repo):
+        """An ASSIGNED trade causes the engine to re-create the assignment."""
         t = repo.add_trade(_trade(status="ASSIGNED"))
-        repo.add_assignment(_assignment(t.id))
         repo.recalculate_positions()
-        assert repo.get_assignments() == []
+        assignments = repo.get_assignments()
+        assert len(assignments) == 1
+        assert assignments[0].trade_id == t.id
 
-    def test_stub_clears_lifecycle(self, repo):
-        t = repo.add_trade(_trade(strategy="CC"))
-        repo.add_covered_call_lifecycle(_lifecycle(t.id))
+    def test_rebuilds_lifecycle_from_cc_trade(self, repo):
+        """A CC trade causes the engine to re-create the lifecycle event."""
+        # Need a prior CSP assignment so shares > 0 before CC is processed
+        repo.add_trade(_trade(strategy="CSP", status="ASSIGNED",
+                               trade_date=date(2026, 1, 10),
+                               expiration=date(2026, 2, 21)))
+        cc = repo.add_trade(_trade(strategy="CC", status="OPEN",
+                                    trade_date=date(2026, 3, 1),
+                                    expiration=date(2026, 3, 21)))
         repo.recalculate_positions()
-        assert repo.get_covered_call_lifecycle() == []
+        events = repo.get_covered_call_lifecycle()
+        assert len(events) == 1
+        assert events[0].trade_id == cc.id
 
-    def test_stub_preserves_trades(self, repo):
+    def test_preserves_trades(self, repo):
         repo.add_trade(_trade())
         repo.recalculate_positions()
         assert len(repo.get_trades()) == 1
 
-    def test_stub_preserves_dividends(self, repo):
+    def test_preserves_dividends(self, repo):
         repo.add_dividend(_dividend())
         repo.recalculate_positions()
         assert len(repo.get_dividends()) == 1
