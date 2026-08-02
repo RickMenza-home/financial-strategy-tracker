@@ -39,7 +39,7 @@ def premium_value(premium: float, contracts: int, action: TradeAction) -> float:
     Returns:
         Signed gross cashflow in dollars.
     """
-    gross = premium * contracts * SHARES_PER_CONTRACT
+    gross = total_premium(premium, contracts)
     return gross if action == TradeAction.SELL else -gross
 
 
